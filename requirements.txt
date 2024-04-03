@@ -1,0 +1,9 @@
+langchain
+python-dotenv
+cassio
+PyPDF2
+langchain-openai
+sqlite-vss
+chromadb
+streamlit
+openai

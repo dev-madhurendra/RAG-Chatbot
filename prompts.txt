@@ -1,0 +1,8 @@
+query_1 = Where is The code we used to train and evaluate our models is available at ?
+query_2 = What is the formula of Attention(Q, K, V ) ? 
+query_3 = What is an Acknowledgements given in the pdf ?
+query_4 = Provide Reference number [23] given in the pdf ?
+query_5 = What is the customer name in pdf ?
+query_6 = What is the customer number in pdf ?
+query_7 = What is the  payment mode in pdf ?
+query_8 = What are all the terms and conditions mention in pdf ?
