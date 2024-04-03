@@ -1,91 +1,141 @@
-# Import necessary libraries
-import os
-from dotenv import load_dotenv, find_dotenv
+
+import streamlit as st
+from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-from langchain.vectorstores.cassandra import Cassandra
-from langchain.indexes.vectorstore import VectorStoreIndexWrapper
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAI, OpenAIEmbeddings
-import cassio
+import chromadb
+from langchain.text_splitter import CharacterTextSplitter
+from chromadb.utils import embedding_functions
+import openai
+import os
 
-# Load environment variables from .env file
-load_dotenv(find_dotenv())
+# Load environment variables
+load_dotenv()
 
-# Get environment variables
-ASTRA_DB_APPLICATION_TOKEN = os.environ.get("ASTRA_DB_APPLICATION_TOKEN")
-ASTRA_DB_ID = os.environ.get("ASTRA_DB_ID")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# Get OpenAI API key from environment variables
+OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
 
-# Read PDF file
-pdf_reader = PdfReader('./data/sample.pdf')
+# Set OpenAI API key
+openai.api_key = OPENAI_API_KEY
 
-# Initialize a variable to store raw text extracted from the PDF
-raw_text = ''
-
-# Extract text from each page of the PDF
-for page in pdf_reader.pages:
-    content = page.extract_text()
-    if content:
-        raw_text += content
-
-# Initialize RecursiveCharacterTextSplitter for chunking text
-text_splitter = RecursiveCharacterTextSplitter(
-    separators=['\n\n', '\n', '.', ' '],
-    chunk_size=800,
-    chunk_overlap=200
+# Initialize OpenAI embedding function
+openai_embedding_functions = embedding_functions.OpenAIEmbeddingFunction(
+    model_name="text-embedding-ada-002", 
+    api_key=OPENAI_API_KEY
 )
 
-# Split raw text into chunks using text splitter
-chunks = text_splitter.split_text(raw_text)
-
-# Initialize CassIO with Astra DB application token and database ID
-cassio.init(token=ASTRA_DB_APPLICATION_TOKEN, database_id=ASTRA_DB_ID)
-
-# Initialize OpenAI language model and embeddings
-llm = OpenAI(openai_api_key=OPENAI_API_KEY)
-embedding = OpenAIEmbeddings()
-
-# Initialize Cassandra vector store with embeddings, table name, session, and keyspace
-astra_vector_store = Cassandra(
-    embedding=embedding,
-    table_name="pdf_vectors",
-    session=None,
-    keyspace="default_keyspace"
+# Connect to ChromaDB and create a collection with the OpenAI embedding function
+chroma_client = chromadb.Client()
+chroma_client.delete_collection("chatbot_collection")
+collection = chroma_client.create_collection(
+    name="chatbot_collection", 
+    embedding_function=openai_embedding_functions
 )
 
-# Add text chunks to the Cassandra vector store
-astra_vector_store.add_texts(chunks)
 
-# Create a vector store index wrapper for the Cassandra vector store
-astra_vector_index = VectorStoreIndexWrapper(vectorstore=astra_vector_store)
+# Function to extract text from PDF files
+def extract_text_from_pdf(pdf_docs):
+    """Extract text from PDF files and concatenate it."""
+    text = ""
+    for pdf in pdf_docs:
+        pdf_reader = PdfReader(pdf)
+        for page in pdf_reader.pages:
+            text += page.extract_text()
+    return text
 
-# Initialize a variable to track whether it's the first question
-is_first_question = True
+# Function to split text into chunks
+def split_text_into_chunks(raw_text):
+    """Split raw text into chunks."""
+    text_splitter = CharacterTextSplitter(
+        separator="\n",
+        chunk_size=800, 
+        chunk_overlap=200, 
+        length_function=len
+    )
+    return text_splitter.split_text(raw_text)
 
-# Main loop to interactively ask questions and retrieve answers
-while True:
-    # Prompt for the first question or subsequent questions
-    prompt = "\n Enter your question (or type 'quit' to exit): " if is_first_question else "\n What's your next question (or type 'quit' to exit): "
-    query_text = input(prompt).strip()
+# Function to add text chunks to ChromaDB collection
+def add_text_chunks_to_collection(text_chunks):
+    """Add text chunks to ChromaDB collection."""
+    documents = text_chunks
+    text_embeddings = openai_embedding_functions(documents)
+    ids = ["item_id" + str(i) for i in range(len(text_chunks))]  # Generate unique IDs for each chunk
+    doc_metadata = [
+        {
+            "chunk_id": id,
+            "source": "PDF",
+            "document_name": "sample.pdf"  # Specify the name of the PDF document
+        }
+        for id in ids
+    ]
+    
+    collection.add(
+        embeddings=text_embeddings, 
+        documents=documents, 
+        ids=ids,
+        metadatas=doc_metadata
+    )
+    return chroma_client
 
-    # Check if the user wants to quit
-    if query_text.lower() == "quit":
-        break
+# Function to get completions from OpenAI chat model
+def get_chat_completion(model, system_msg, query):
+    """Get completions from OpenAI chat model."""
+    return openai.Client(api_key=OPENAI_API_KEY).chat.completions.create(
+        model=model,
+        messages=[
+            {
+                'role': "system", 
+                "content": system_msg
+            },
+            {
+                "role": "user", 
+                "content": query
+            }
+        ],
+        temperature=0.0,
+        max_tokens=150,
+    )
 
-    # Skip if the user enters an empty query
-    if not query_text:
-        continue
+# Function to retrieve query results from ChromaDB
+def retrieve_query_results_from_db(user_query):
+    """Retrieve query results from ChromaDB."""
+    results = collection.query(query_texts=[user_query], n_results=1)
+    print(">>> vector db query ",  results)
+    
+    context_msg = "\n".join(doc[0] for doc in results['documents'])
+    print(">>> context message ", context_msg)
+    return interact_with_open_ai_chat_modal(user_query, context_msg)
 
-    # Set is_first_question to False after the first iteration
-    is_first_question = False
+# Function to interact with OpenAI chatbot
+def interact_with_open_ai_chat_modal(query, context_msg):
+    """Interact with OpenAI chatbot."""
+    system_msg = f""" You are a dedicated support agent. Please provide accurate responses based on the given context.
+    Your task is to address inquiries within the provided context. Ensure that your answers align with the context of the question.
+    Avoid speculation and provide responses only to the questions asked.
+    If a question is unrelated to the context, respond with 'Out of Context'.
+    Below is the provided context:
+    {context_msg} """
 
-    print("\n QUESTION: \"%s\"" % query_text)
+    response = get_chat_completion("gpt-3.5-turbo" , system_msg, query)
+    chatbot_response = response.choices[0].message.content.strip()
+    return chatbot_response
 
-    # Query the vector store index with the question and the OpenAI language model
-    answer = astra_vector_index.query(question=query_text, llm=llm).strip()
-    print("\n ANSWER: \"%s\"" % answer)
+# Streamlit app
+def main():
+    st.title("RAG Use Case")
 
-    # Print the first document by relevance
-    print("FIRST DOCUMENT BY RELEVANCE:")
-    for doc, score in astra_vector_store.similarity_search_with_score(query_text, k=4):
-        print("    [%0.4f] \"%s ...\"" % (score, doc.page_content[:84]))
+    pdf_file = st.file_uploader("Upload PDF File", type=["pdf"])
+
+    if pdf_file:
+        st.write("PDF File Uploaded Successfully!")
+        pdf_text = extract_text_from_pdf([pdf_file])
+        text_chunks = split_text_into_chunks(pdf_text)
+        add_text_chunks_to_collection(text_chunks)
+        st.write("Text extracted and added to collection!")
+
+    user_query = st.text_input("You:", "")
+    if st.button("Send"):
+        chatbot_response = retrieve_query_results_from_db(user_query)
+        st.write("ChatBot:", chatbot_response)
+
+if __name__ == "__main__":
+    main()
